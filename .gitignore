@@ -34,3 +34,6 @@ configs/server.yaml
 # 临时文件
 tmp/
 temp/
+
+# Wintun DLL（通过脚本下载，不提交到仓库）
+internal/wintun/*.dll

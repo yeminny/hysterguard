@@ -13,6 +13,7 @@ import (
 
 	"github.com/hysterguard/hysterguard/internal/config"
 	"github.com/hysterguard/hysterguard/internal/tunnel"
+	"github.com/hysterguard/hysterguard/internal/wintun"
 )
 
 var (
@@ -74,6 +75,11 @@ func runClient(cmd *cobra.Command, args []string) error {
 		"server", cfg.Hysteria.Server,
 		"obfs", cfg.Hysteria.Obfs.Type,
 	)
+
+	// Windows: 确保 wintun.dll 已加载
+	if err := wintun.EnsureLoaded(); err != nil {
+		return fmt.Errorf("failed to load wintun: %w", err)
+	}
 
 	// 创建隧道
 	tun, err := tunnel.NewClientTunnel(cfg, logger)
