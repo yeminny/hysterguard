@@ -46,7 +46,7 @@ func (e *ServerEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 // NewHysteriaServerBind 创建服务端绑定
 func NewHysteriaServerBind() *HysteriaServerBind {
 	return &HysteriaServerBind{
-		recvChan: make(chan *serverPacket, 1024), // 调整为 1024 (约1.5MB)，避免 Bufferbloat 导致 BBR 降速
+		recvChan: make(chan *serverPacket, 4096), // 增大缓冲队列，防止突发流量丢包
 		closed:   atomic.Bool{},
 	}
 }
@@ -84,6 +84,7 @@ func (b *HysteriaServerBind) DeliverPacket(data []byte, clientAddr string) {
 	}:
 	default:
 		// 队列满或已关闭，丢弃包
+		// TODO: 可以添加日志或者 metrics
 	}
 }
 
@@ -92,7 +93,7 @@ func (b *HysteriaServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, erro
 	b.mu.Lock()
 	// 重新创建 channel（如果之前被关闭）
 	if b.recvChan == nil {
-		b.recvChan = make(chan *serverPacket, 1024)
+		b.recvChan = make(chan *serverPacket, 4096)
 	}
 	b.closed.Store(false)
 	ch := b.recvChan
