@@ -280,6 +280,55 @@ func (d *WireGuardDevice) configureTUNAddress() error {
 
 		d.logger.Info("TUN interface configured", "device", name, "ip", d.config.TUN.Address.IPv4)
 
+	case "windows":
+		// Windows: 使用 netsh 配置 TUN 接口
+		// 获取接口名称（Wintun 创建的适配器名称）
+		name, err := d.tunDevice.Name()
+		if err != nil {
+			return fmt.Errorf("failed to get TUN device name: %w", err)
+		}
+		d.logger.Debug("Configuring Windows TUN device", "name", name)
+
+		// 配置 IPv4 地址
+		ipv4 := d.config.TUN.Address.IPv4
+		if ipv4 != "" {
+			// 解析 CIDR 获取 IP 和掩码
+			ip, ipnet, err := net.ParseCIDR(ipv4)
+			if err != nil {
+				return fmt.Errorf("failed to parse IPv4: %w", err)
+			}
+			mask := net.IP(ipnet.Mask).String()
+
+			// netsh interface ip set address "接口名" static IP地址 子网掩码 网关
+			// 对于 TUN 设备，不设置网关
+			if err := runCommand("netsh", "interface", "ip", "set", "address",
+				name, "static", ip.String(), mask); err != nil {
+				return fmt.Errorf("failed to configure IPv4: %w", err)
+			}
+			d.logger.Info("IPv4 address configured", "device", name, "ip", ipv4)
+		}
+
+		// 配置 IPv6 地址
+		ipv6 := d.config.TUN.Address.IPv6
+		if ipv6 != "" {
+			// 解析 CIDR 获取 IP 和前缀长度
+			ip, ipnet, err := net.ParseCIDR(ipv6)
+			if err != nil {
+				d.logger.Warn("Failed to parse IPv6 address", "error", err)
+			} else {
+				prefixLen, _ := ipnet.Mask.Size()
+				// netsh interface ipv6 add address "接口名" IP/前缀
+				if err := runCommand("netsh", "interface", "ipv6", "add", "address",
+					name, fmt.Sprintf("%s/%d", ip.String(), prefixLen)); err != nil {
+					d.logger.Warn("Failed to configure IPv6 address", "error", err)
+				} else {
+					d.logger.Info("IPv6 address configured", "device", name, "ip", ipv6)
+				}
+			}
+		}
+
+		d.logger.Info("TUN interface configured", "device", name, "ip", d.config.TUN.Address.IPv4)
+
 	default:
 		d.logger.Warn("Automatic TUN configuration not supported on this platform, please configure manually")
 	}

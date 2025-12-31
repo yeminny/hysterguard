@@ -41,6 +41,8 @@ func (d *DNSManager) Setup() error {
 		return d.setupDarwin()
 	case "linux":
 		return d.setupLinux()
+	case "windows":
+		return d.setupWindows()
 	default:
 		d.logger.Warn("DNS configuration not supported on this platform")
 		return nil
@@ -60,6 +62,8 @@ func (d *DNSManager) Teardown() error {
 		return d.teardownDarwin()
 	case "linux":
 		return d.teardownLinux()
+	case "windows":
+		return d.teardownWindows()
 	default:
 		return nil
 	}
@@ -200,6 +204,58 @@ func (d *DNSManager) teardownLinux() error {
 
 	d.configured = false
 	d.originalDNS = make(map[string][]string)
+	d.logger.Info("DNS settings restored")
+	return nil
+}
+
+// setupWindows Windows DNS 配置 (使用 netsh)
+func (d *DNSManager) setupWindows() error {
+	// 获取所有网络接口并设置 DNS
+	// 主要针对 VPN 接口设置 DNS
+	d.logger.Debug("Configuring DNS on Windows")
+
+	// 设置主 DNS 和备用 DNS
+	if len(d.dnsServers) > 0 {
+		// 设置主 DNS
+		if err := d.runCmd("netsh", "interface", "ip", "set", "dns",
+			"hysterguard0", "static", d.dnsServers[0], "primary"); err != nil {
+			d.logger.Warn("Failed to set primary DNS", "error", err)
+		}
+
+		// 添加备用 DNS
+		for i := 1; i < len(d.dnsServers); i++ {
+			// 只添加 IPv4 DNS
+			if !strings.Contains(d.dnsServers[i], ":") {
+				if err := d.runCmd("netsh", "interface", "ip", "add", "dns",
+					"hysterguard0", d.dnsServers[i], "index="+fmt.Sprintf("%d", i+1)); err != nil {
+					d.logger.Warn("Failed to add secondary DNS", "error", err)
+				}
+			}
+		}
+
+		// 添加 IPv6 DNS
+		for _, server := range d.dnsServers {
+			if strings.Contains(server, ":") {
+				if err := d.runCmd("netsh", "interface", "ipv6", "add", "dnsservers",
+					"hysterguard0", server); err != nil {
+					d.logger.Warn("Failed to add IPv6 DNS", "error", err)
+				}
+			}
+		}
+	}
+
+	d.configured = true
+	d.logger.Info("DNS configured successfully")
+	return nil
+}
+
+// teardownWindows Windows DNS 恢复
+func (d *DNSManager) teardownWindows() error {
+	// 将 DNS 设置回 DHCP
+	d.runCmd("netsh", "interface", "ip", "set", "dns", "hysterguard0", "dhcp")
+	d.runCmd("netsh", "interface", "ipv6", "set", "dnsservers", "hysterguard0", "dhcp")
+
+	d.configured = false
 	d.logger.Info("DNS settings restored")
 	return nil
 }

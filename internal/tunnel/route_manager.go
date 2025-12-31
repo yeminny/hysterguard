@@ -46,6 +46,8 @@ func (r *RouteManager) Setup() error {
 		return r.setupDarwin()
 	case "linux":
 		return r.setupLinux()
+	case "windows":
+		return r.setupWindows()
 	default:
 		r.logger.Warn("Automatic route configuration not supported on this platform")
 		return nil
@@ -65,6 +67,8 @@ func (r *RouteManager) Cleanup() error {
 		return r.cleanupDarwin()
 	case "linux":
 		return r.cleanupLinux()
+	case "windows":
+		return r.cleanupWindows()
 	default:
 		return nil
 	}
@@ -287,6 +291,107 @@ func (r *RouteManager) getDefaultGatewayLinux() (string, error) {
 	for i, field := range fields {
 		if field == "via" && i+1 < len(fields) {
 			return fields[i+1], nil
+		}
+	}
+
+	return "", fmt.Errorf("default gateway not found")
+}
+
+// setupWindows Windows 路由配置
+func (r *RouteManager) setupWindows() error {
+	// 1. 获取当前默认网关
+	gateway, err := r.getDefaultGatewayWindows()
+	if err != nil {
+		return fmt.Errorf("failed to get default gateway: %w", err)
+	}
+	r.gateway = gateway
+	r.logger.Debug("Current default gateway", "gateway", gateway)
+
+	// 2. 添加到服务器的直接路由（确保 Hysteria 连接不走 VPN）
+	r.logger.Debug("Adding direct route to server", "server", r.serverIP, "gateway", gateway)
+	if err := r.runCmd("route", "add", r.serverIP, "mask", "255.255.255.255", gateway, "metric", "1"); err != nil {
+		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
+	} else {
+		r.routesAdded = append(r.routesAdded, r.serverIP)
+	}
+
+	// 3. 添加 VPN 路由 (0.0.0.0/1 和 128.0.0.0/1 覆盖默认路由)
+	r.logger.Debug("Adding VPN routes (IPv4)")
+	// 使用接口名称添加路由
+	if err := r.runCmd("route", "add", "0.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
+		return fmt.Errorf("failed to add route 0.0.0.0/1: %w", err)
+	}
+	if err := r.runCmd("route", "add", "128.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
+		return fmt.Errorf("failed to add route 128.0.0.0/1: %w", err)
+	}
+
+	// 4. 添加 IPv6 路由
+	if r.tunDevice != "" {
+		r.logger.Debug("Adding VPN routes (IPv6)", "device", r.tunDevice)
+		// Windows IPv6 路由：使用接口索引或名称
+		r.runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", r.tunDevice, "metric=5")
+		r.runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", r.tunDevice, "metric=5")
+	}
+
+	r.configured = true
+	r.logger.Info("VPN routes configured successfully")
+	return nil
+}
+
+// cleanupWindows Windows 路由恢复
+func (r *RouteManager) cleanupWindows() error {
+	var errs []error
+
+	// 1. 删除 VPN 路由
+	r.logger.Debug("Removing VPN routes")
+	if err := r.runCmd("route", "delete", "0.0.0.0", "mask", "128.0.0.0"); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.runCmd("route", "delete", "128.0.0.0", "mask", "128.0.0.0"); err != nil {
+		errs = append(errs, err)
+	}
+
+	// 删除 IPv6 路由
+	if r.tunDevice != "" {
+		r.runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", r.tunDevice)
+		r.runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", r.tunDevice)
+	}
+
+	// 2. 删除服务器直接路由
+	for _, route := range r.routesAdded {
+		r.logger.Debug("Removing server route", "route", route)
+		if err := r.runCmd("route", "delete", route); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	r.configured = false
+	r.routesAdded = nil
+
+	if len(errs) > 0 {
+		r.logger.Warn("Some routes could not be removed", "errors", errs)
+	} else {
+		r.logger.Info("Original routes restored")
+	}
+
+	return nil
+}
+
+// getDefaultGatewayWindows 获取 Windows 默认网关
+func (r *RouteManager) getDefaultGatewayWindows() (string, error) {
+	cmd := exec.Command("route", "print", "0.0.0.0")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		// 寻找 0.0.0.0 开头的行
+		if len(fields) >= 3 && fields[0] == "0.0.0.0" {
+			// 格式: 0.0.0.0  0.0.0.0  网关  接口  跃点
+			return fields[2], nil
 		}
 	}
 
