@@ -201,6 +201,10 @@ tun:
 - 设置防火墙规则
 - 记录日志
 
+> **注意**: `ip rule` 命令仅适用于 Linux。
+> - **macOS**: 使用 `route` 命令添加静态路由 (例如: `route -n add -net <目标IP> <网关IP>`)。
+> - **Windows**: 使用 `route` 命令 (例如: `route add <目标IP> <网关IP>`)。
+
 ### TLS 证书
 
 服务端需要有效的 TLS 证书。推荐使用 Let's Encrypt:
@@ -268,9 +272,11 @@ tun:
 
 ### 在服务器上运行客户端导致 SSH 断开
 
-如果你在 VPS 上运行客户端（如测试 Linux 客户端），VPN 会接管所有流量导致 SSH 断开。
+### 在服务器上运行客户端导致 SSH 断开
 
-**解决方案**: 使用策略路由让服务器公网 IP 的流量走原路由：
+如果你在 Linux VPS 上运行客户端进行测试，VPN 会接管所有流量导致 SSH 断开。
+
+**解决方案 (Linux Only)**: 使用策略路由让服务器公网 IP 的流量走原路由：
 
 ```yaml
 tun:
