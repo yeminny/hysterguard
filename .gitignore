@@ -10,7 +10,6 @@ server-*
 *.o
 *.a
 *.so
-go.sum
 
 # IDE
 .idea/

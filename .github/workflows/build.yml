@@ -50,36 +50,25 @@ jobs:
         run: |
           mkdir -p dist
           
-          # Build matrix
-          PLATFORMS=(
-            "linux/amd64"
-            "linux/arm64"
-            "linux/arm"
-            "darwin/amd64"
-            "darwin/arm64"
-            "windows/amd64"
-            "windows/arm64"
-          )
-          
-          for PLATFORM in "${PLATFORMS[@]}"; do
+          # Client builds - all platforms
+          echo "Building clients..."
+          for PLATFORM in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             GOOS="${PLATFORM%/*}"
             GOARCH="${PLATFORM#*/}"
-            
-            # Client
-            CLIENT_NAME="hysterguard-client-${GOOS}-${GOARCH}"
-            if [ "$GOOS" = "windows" ]; then
-              CLIENT_NAME="${CLIENT_NAME}.exe"
-            fi
-            echo "Building $CLIENT_NAME..."
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" -o "dist/$CLIENT_NAME" ./cmd/client
-            
-            # Server
-            SERVER_NAME="hysterguard-server-${GOOS}-${GOARCH}"
-            if [ "$GOOS" = "windows" ]; then
-              SERVER_NAME="${SERVER_NAME}.exe"
-            fi
-            echo "Building $SERVER_NAME..."
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.version }}" -o "dist/$SERVER_NAME" ./cmd/server
+            NAME="hysterguard-client-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then NAME="${NAME}.exe"; fi
+            echo "  Building $NAME..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/$NAME" ./cmd/client
+          done
+          
+          # Server builds - Linux only (macOS and Windows not supported yet)
+          echo "Building servers (Linux only)..."
+          for PLATFORM in linux/amd64 linux/arm64; do
+            GOOS="${PLATFORM%/*}"
+            GOARCH="${PLATFORM#*/}"
+            NAME="hysterguard-server-${GOOS}-${GOARCH}"
+            echo "  Building $NAME..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/$NAME" ./cmd/server
           done
           
           ls -la dist/
