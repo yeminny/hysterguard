@@ -307,7 +307,16 @@ func (r *RouteManager) setupWindows() error {
 	r.gateway = gateway
 	r.logger.Debug("Current default gateway", "gateway", gateway)
 
-	// 2. 添加到服务器的直接路由（确保 Hysteria 连接不走 VPN）
+	// 2. 获取 TUN 接口索引
+	ifIndex, err := r.getInterfaceIndex(r.tunDevice)
+	if err != nil {
+		r.logger.Warn("Failed to get interface index, routes may bind to wrong interface", "error", err)
+		ifIndex = ""
+	} else {
+		r.logger.Debug("Got TUN interface index", "device", r.tunDevice, "index", ifIndex)
+	}
+
+	// 3. 添加到服务器的直接路由（确保 Hysteria 连接不走 VPN）
 	r.logger.Debug("Adding direct route to server", "server", r.serverIP, "gateway", gateway)
 	if err := r.runCmd("route", "add", r.serverIP, "mask", "255.255.255.255", gateway, "metric", "1"); err != nil {
 		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
@@ -315,20 +324,31 @@ func (r *RouteManager) setupWindows() error {
 		r.routesAdded = append(r.routesAdded, r.serverIP)
 	}
 
-	// 3. 添加 VPN 路由 (0.0.0.0/1 和 128.0.0.0/1 覆盖默认路由)
-	r.logger.Debug("Adding VPN routes (IPv4)")
-	// 使用接口名称添加路由
-	if err := r.runCmd("route", "add", "0.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
-		return fmt.Errorf("failed to add route 0.0.0.0/1: %w", err)
-	}
-	if err := r.runCmd("route", "add", "128.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
-		return fmt.Errorf("failed to add route 128.0.0.0/1: %w", err)
+	// 4. 添加 VPN 路由 (0.0.0.0/1 和 128.0.0.0/1 覆盖默认路由)
+	r.logger.Debug("Adding VPN routes (IPv4)", "interface_index", ifIndex)
+
+	// Windows route add 需要指定接口索引才能绑定到正确的 TUN
+	if ifIndex != "" {
+		if err := r.runCmd("route", "add", "0.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5", "if", ifIndex); err != nil {
+			return fmt.Errorf("failed to add route 0.0.0.0/1: %w", err)
+		}
+		if err := r.runCmd("route", "add", "128.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5", "if", ifIndex); err != nil {
+			return fmt.Errorf("failed to add route 128.0.0.0/1: %w", err)
+		}
+	} else {
+		// Fallback: 不指定接口（可能绑定到错误接口）
+		if err := r.runCmd("route", "add", "0.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
+			return fmt.Errorf("failed to add route 0.0.0.0/1: %w", err)
+		}
+		if err := r.runCmd("route", "add", "128.0.0.0", "mask", "128.0.0.0", r.tunGateway, "metric", "5"); err != nil {
+			return fmt.Errorf("failed to add route 128.0.0.0/1: %w", err)
+		}
 	}
 
-	// 4. 添加 IPv6 路由
+	// 5. 添加 IPv6 路由
 	if r.tunDevice != "" {
 		r.logger.Debug("Adding VPN routes (IPv6)", "device", r.tunDevice)
-		// Windows IPv6 路由：使用接口索引或名称
+		// Windows IPv6 路由：使用接口名称
 		r.runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", r.tunDevice, "metric=5")
 		r.runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", r.tunDevice, "metric=5")
 	}
@@ -336,6 +356,29 @@ func (r *RouteManager) setupWindows() error {
 	r.configured = true
 	r.logger.Info("VPN routes configured successfully")
 	return nil
+}
+
+// getInterfaceIndex 获取 Windows 网络接口索引
+func (r *RouteManager) getInterfaceIndex(ifName string) (string, error) {
+	// 使用 netsh 获取接口信息
+	cmd := exec.Command("netsh", "interface", "ip", "show", "interface")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, ifName) {
+			fields := strings.Fields(line)
+			if len(fields) >= 1 {
+				// 第一个字段是接口索引
+				return fields[0], nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("interface %s not found", ifName)
 }
 
 // cleanupWindows Windows 路由恢复
