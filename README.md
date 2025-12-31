@@ -228,6 +228,38 @@ sudo certbot certonly --standalone -d your-domain.com
 
 或者使用自签证书（客户端需设置 `insecure: true`）。
 
+### 出口网口配置（Linux 服务端）
+
+当服务器有多个网口时（如原生 IPv4 接口 + WARP IPv6 接口），可以指定 VPN 流量从哪个网口出去：
+
+```yaml
+outbound:
+  ipv4_device: "ens4"   # IPv4 走原生接口
+  ipv6_device: "warp"   # IPv6 走 WARP 接口
+```
+
+**工作原理**：使用策略路由 (policy routing)，创建专用路由表并用 `ip rule` 指定 VPN 流量使用该表。
+
+**智能检测**：留空或设为 `"auto"` 时，自动检测并使用当前系统的默认出口：
+
+```yaml
+outbound:
+  ipv4_device: ""       # 自动检测
+  ipv6_device: "auto"   # 自动检测
+```
+
+**验证规则**：
+```bash
+# 查看策略路由规则
+ip rule show
+ip -6 rule show
+# 应该看到: from 10.10.0.0/24 lookup 100
+
+# 查看路由表
+ip route show table 100
+ip -6 route show table 101
+```
+
 ## 命令行选项
 
 ```bash

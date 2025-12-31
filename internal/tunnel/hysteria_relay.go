@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/apernet/hysteria/extras/v2/obfs"
@@ -54,6 +55,14 @@ func (r *HysteriaUDPRelay) Connect(ctx context.Context) error {
 		TLSConfig: client.TLSConfig{
 			ServerName:         r.config.Hysteria.SNI,
 			InsecureSkipVerify: r.config.Hysteria.Insecure,
+		},
+		QUICConfig: client.QUICConfig{
+			InitialStreamReceiveWindow:     8388608,  // 8MB
+			MaxStreamReceiveWindow:         8388608,  // 8MB
+			InitialConnectionReceiveWindow: 20971520, // 20MB
+			MaxConnectionReceiveWindow:     20971520, // 20MB
+			MaxIdleTimeout:                 30 * time.Second,
+			KeepAlivePeriod:                10 * time.Second,
 		},
 	}
 
@@ -187,6 +196,20 @@ func (r *HysteriaUDPRelay) LocalAddr() net.Addr {
 	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 }
 
+// udpConnFactory UDP 连接工厂
+type udpConnFactory struct{}
+
+func (f *udpConnFactory) New(addr net.Addr) (net.PacketConn, error) {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	// 设置 4MB 缓冲区以提高吞吐量稳定性
+	_ = conn.SetReadBuffer(4194304)
+	_ = conn.SetWriteBuffer(4194304)
+	return conn, nil
+}
+
 // obfsConnFactory 带混淆的连接工厂
 type obfsConnFactory struct {
 	obfs       obfs.Obfuscator
@@ -198,6 +221,9 @@ func (f *obfsConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 设置 4MB 缓冲区以提高吞吐量稳定性
+	_ = conn.SetReadBuffer(4194304)
+	_ = conn.SetWriteBuffer(4194304)
 	return obfs.WrapPacketConn(conn, f.obfs), nil
 }
 

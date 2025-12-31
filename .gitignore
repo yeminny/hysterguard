@@ -1,8 +1,8 @@
 # 编译输出
 build/
 *.exe
-client
-server
+/client
+/server
 client-*
 server-*
 

@@ -270,34 +270,218 @@ func (t *ServerTunnel) setupNAT() {
 		t.logger.Warn("Failed to enable IPv6 forwarding", "error", err)
 	}
 
-	// IPv4 NAT
+	// 获取 VPN 网段
+	ipv4Network := ""
 	ipv4 := t.config.WireGuard.Address.IPv4
 	if idx := strings.Index(ipv4, "/"); idx > 0 {
 		network := ipv4[:idx]
 		parts := strings.Split(network, ".")
 		if len(parts) == 4 {
-			network = fmt.Sprintf("%s.%s.%s.0/24", parts[0], parts[1], parts[2])
-		}
-
-		if err := runCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", network, "-j", "MASQUERADE"); err != nil {
-			t.logger.Warn("Failed to add IPv4 NAT rule", "error", err)
-		} else {
-			t.logger.Info("IPv4 NAT configured", "network", network)
+			ipv4Network = fmt.Sprintf("%s.%s.%s.0/24", parts[0], parts[1], parts[2])
 		}
 	}
 
-	// IPv6 NAT（如果配置了 IPv6）
-	ipv6 := t.config.WireGuard.Address.IPv6
-	if ipv6 != "" {
-		// 提取 IPv6 网段，如 fd00::1/64 -> fd00::/64
-		// 简化处理：直接使用固定的 fd00::/64 网段
-		ipv6Network := "fd00::/64"
+	ipv6Network := "fd00::/64"
+
+	// 获取 IPv4 出口设备
+	ipv4Device := t.config.Outbound.IPv4Device
+	if ipv4Device == "" || ipv4Device == "auto" {
+		if detected, err := detectOutboundDevice(4); err == nil && detected != "" {
+			ipv4Device = detected
+			t.logger.Info("Auto-detected IPv4 outbound device", "device", ipv4Device)
+		}
+	}
+
+	// 获取 IPv6 出口设备
+	ipv6Device := t.config.Outbound.IPv6Device
+	if ipv6Device == "" || ipv6Device == "auto" {
+		if detected, err := detectOutboundDevice(6); err == nil && detected != "" {
+			ipv6Device = detected
+			t.logger.Info("Auto-detected IPv6 outbound device", "device", ipv6Device)
+		}
+	}
+
+	// 配置 IPv4 策略路由（如果指定了设备）
+	if ipv4Device != "" && ipv4Network != "" {
+		t.setupPolicyRouting(4, ipv4Device, ipv4Network)
+	}
+
+	// 配置 IPv6 策略路由（如果指定了设备）
+	if ipv6Device != "" && t.config.WireGuard.Address.IPv6 != "" {
+		t.setupPolicyRouting(6, ipv6Device, ipv6Network)
+	}
+
+	// 获取 TUN 设备名称
+	tunName := "wg0"
+	if t.tunDevice != nil {
+		if name, err := t.tunDevice.Name(); err == nil {
+			tunName = name
+		}
+	}
+
+	// 配置 FORWARD 链规则（允许 VPN 流量转发）
+	// 许多 Linux 发行版默认 FORWARD 策略为 DROP
+	t.logger.Debug("Setting up FORWARD rules", "device", tunName)
+
+	// IPv4 FORWARD 规则
+	if err := runCommand("iptables", "-A", "FORWARD", "-i", tunName, "-j", "ACCEPT"); err != nil {
+		t.logger.Debug("FORWARD rule add result", "direction", "in", "error", err)
+	}
+	if err := runCommand("iptables", "-A", "FORWARD", "-o", tunName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+		t.logger.Debug("FORWARD rule add result", "direction", "out", "error", err)
+	}
+	t.logger.Info("IPv4 FORWARD rules configured", "device", tunName)
+
+	// IPv6 FORWARD 规则
+	if t.config.WireGuard.Address.IPv6 != "" {
+		if err := runCommand("ip6tables", "-A", "FORWARD", "-i", tunName, "-j", "ACCEPT"); err != nil {
+			t.logger.Debug("IPv6 FORWARD rule add result", "direction", "in", "error", err)
+		}
+		if err := runCommand("ip6tables", "-A", "FORWARD", "-o", tunName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+			t.logger.Debug("IPv6 FORWARD rule add result", "direction", "out", "error", err)
+		}
+		t.logger.Info("IPv6 FORWARD rules configured", "device", tunName)
+	}
+
+	// IPv4 NAT（不指定 -o，让 MASQUERADE 自动适应）
+	if ipv4Network != "" {
+		if err := runCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", ipv4Network, "-j", "MASQUERADE"); err != nil {
+			t.logger.Warn("Failed to add IPv4 NAT rule", "error", err)
+		} else {
+			t.logger.Info("IPv4 NAT configured", "network", ipv4Network)
+		}
+	}
+
+	// IPv6 NAT（不指定 -o，让 MASQUERADE 自动适应）
+	if t.config.WireGuard.Address.IPv6 != "" {
 		if err := runCommand("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", ipv6Network, "-j", "MASQUERADE"); err != nil {
 			t.logger.Warn("Failed to add IPv6 NAT rule", "error", err)
 		} else {
 			t.logger.Info("IPv6 NAT configured", "network", ipv6Network)
 		}
 	}
+}
+
+// setupPolicyRouting 配置策略路由
+// 使用专用路由表强制 VPN 流量走指定设备
+func (t *ServerTunnel) setupPolicyRouting(ipVersion int, device string, vpnNetwork string) {
+	var tableID string
+	var ipCmd string
+
+	if ipVersion == 4 {
+		tableID = "100"
+		ipCmd = "ip"
+	} else {
+		tableID = "101"
+		ipCmd = "ip"
+	}
+
+	t.logger.Debug("Setting up policy routing", "version", ipVersion, "device", device, "table", tableID)
+
+	// 获取该设备的网关
+	gateway, err := getDeviceGateway(ipVersion, device)
+	if err != nil {
+		t.logger.Warn("Failed to get gateway for device, skipping policy routing", "device", device, "error", err)
+		return
+	}
+
+	// 1. 添加路由表中的默认路由
+	var routeArgs []string
+	if ipVersion == 4 {
+		routeArgs = []string{"route", "add", "default", "via", gateway, "dev", device, "table", tableID}
+	} else {
+		// IPv6 可能没有 via，直接用 dev
+		if gateway != "" {
+			routeArgs = []string{"-6", "route", "add", "default", "via", gateway, "dev", device, "table", tableID}
+		} else {
+			routeArgs = []string{"-6", "route", "add", "default", "dev", device, "table", tableID}
+		}
+	}
+
+	if err := runCommand(ipCmd, routeArgs...); err != nil {
+		// 路由可能已存在
+		t.logger.Debug("Route add result (may already exist)", "error", err)
+	}
+
+	// 2. 添加策略规则：来自 VPN 网段的流量使用专用路由表
+	var ruleArgs []string
+	if ipVersion == 4 {
+		ruleArgs = []string{"rule", "add", "from", vpnNetwork, "lookup", tableID, "priority", "100"}
+	} else {
+		ruleArgs = []string{"-6", "rule", "add", "from", vpnNetwork, "lookup", tableID, "priority", "100"}
+	}
+
+	if err := runCommand(ipCmd, ruleArgs...); err != nil {
+		t.logger.Debug("Rule add result (may already exist)", "error", err)
+	}
+
+	if ipVersion == 4 {
+		t.logger.Info("IPv4 policy routing configured", "device", device, "table", tableID, "gateway", gateway)
+	} else {
+		t.logger.Info("IPv6 policy routing configured", "device", device, "table", tableID)
+	}
+}
+
+// getDeviceGateway 获取设备的网关地址
+func getDeviceGateway(ipVersion int, device string) (string, error) {
+	var args []string
+
+	if ipVersion == 4 {
+		args = []string{"route", "show", "dev", device}
+	} else {
+		args = []string{"-6", "route", "show", "dev", device}
+	}
+
+	output, err := exec.Command("ip", args...).Output()
+	if err != nil {
+		return "", err
+	}
+
+	// 解析输出，查找 default via xxx 或直接返回空（对于点对点接口）
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "default") {
+			parts := strings.Fields(line)
+			for i, part := range parts {
+				if part == "via" && i+1 < len(parts) {
+					return parts[i+1], nil
+				}
+			}
+		}
+	}
+
+	// 对于点对点接口（如 warp），可能没有 via，返回空字符串表示直连
+	return "", nil
+}
+
+// detectOutboundDevice 自动检测出口网口
+// 使用 `ip route get <目标IP>` 获取实际出口设备
+func detectOutboundDevice(ipVersion int) (string, error) {
+	var args []string
+
+	if ipVersion == 4 {
+		args = []string{"route", "get", "1.1.1.1"}
+	} else {
+		args = []string{"-6", "route", "get", "2606:4700::1111"}
+	}
+
+	output, err := exec.Command("ip", args...).Output()
+	if err != nil {
+		return "", err
+	}
+
+	// 解析输出，提取 "dev xxx" 字段
+	// 示例: "1.1.1.1 via 192.168.1.1 dev ens4 src 192.168.1.209 uid 0"
+	// 示例: "2606:4700::1111 from :: dev warp proto kernel src 2606:4700:..."
+	outputStr := string(output)
+	parts := strings.Fields(outputStr)
+	for i, part := range parts {
+		if part == "dev" && i+1 < len(parts) {
+			return parts[i+1], nil
+		}
+	}
+
+	return "", fmt.Errorf("could not parse device from: %s", outputStr)
 }
 
 // decodeWireGuardKeyServer 解码 WireGuard 密钥

@@ -55,6 +55,13 @@ wireguard:
   #   - "ip -4 rule delete from 服务器公网IP lookup main"
   #   - "iptables -D FORWARD -i wg0 -j ACCEPT"
 
+# 出口网口配置（可选，仅 Linux）
+# 指定 VPN 客户端流量从哪个网口出去
+# 留空或 "auto" 则智能检测系统当前的出口网口
+outbound:
+  ipv4_device: ""    # IPv4 出口设备，如 "ens4"
+  ipv6_device: ""    # IPv6 出口设备，如 "warp"
+
 # 日志配置
 log:
   level: "info"

@@ -22,6 +22,7 @@ type ServerConfig struct {
 	Listen    string                `yaml:"listen"`
 	Hysteria  HysteriaServerConfig  `yaml:"hysteria"`
 	WireGuard WireGuardServerConfig `yaml:"wireguard"`
+	Outbound  OutboundConfig        `yaml:"outbound"`
 	Log       LogConfig             `yaml:"log"`
 }
 
@@ -87,6 +88,12 @@ type WireGuardServerConfig struct {
 	Address    AddressConfig `yaml:"address"`
 	PostUp     []string      `yaml:"post_up"`   // 接口启动后执行的命令
 	PostDown   []string      `yaml:"post_down"` // 接口关闭前执行的命令
+}
+
+// OutboundConfig 出口网口配置（仅 Linux）
+type OutboundConfig struct {
+	IPv4Device string `yaml:"ipv4_device"` // IPv4 出口设备，如 "ens4"，留空自动检测
+	IPv6Device string `yaml:"ipv6_device"` // IPv6 出口设备，如 "warp"，留空自动检测
 }
 
 // PeerConfig WireGuard 对端配置
