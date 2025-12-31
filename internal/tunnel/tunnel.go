@@ -210,7 +210,7 @@ func (t *ClientTunnel) Stop() error {
 
 	// 恢复路由（在关闭 WireGuard 之前）
 	if t.routeManager != nil {
-		if err := t.routeManager.Teardown(); err != nil {
+		if err := t.routeManager.Cleanup(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to restore routes: %w", err))
 		}
 		t.routeManager = nil

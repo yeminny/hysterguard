@@ -52,8 +52,8 @@ func (r *RouteManager) Setup() error {
 	}
 }
 
-// Teardown 恢复原始路由
-func (r *RouteManager) Teardown() error {
+// Cleanup 恢复原始路由
+func (r *RouteManager) Cleanup() error {
 	if !r.configured {
 		return nil
 	}
@@ -62,9 +62,9 @@ func (r *RouteManager) Teardown() error {
 
 	switch runtime.GOOS {
 	case "darwin":
-		return r.teardownDarwin()
+		return r.cleanupDarwin()
 	case "linux":
-		return r.teardownLinux()
+		return r.cleanupLinux()
 	default:
 		return nil
 	}
@@ -121,8 +121,8 @@ func (r *RouteManager) setupDarwin() error {
 	return nil
 }
 
-// teardownDarwin macOS 路由恢复
-func (r *RouteManager) teardownDarwin() error {
+// cleanupDarwin macOS 路由恢复
+func (r *RouteManager) cleanupDarwin() error {
 	var errs []error
 
 	// 1. 删除 VPN 路由 (IPv4)
@@ -166,78 +166,6 @@ func (r *RouteManager) teardownDarwin() error {
 	return nil
 }
 
-// setupLinux Linux 路由配置
-func (r *RouteManager) setupLinux() error {
-	// 1. 获取当前默认网关
-	gateway, err := r.getDefaultGatewayLinux()
-	if err != nil {
-		return fmt.Errorf("failed to get default gateway: %w", err)
-	}
-	r.gateway = gateway
-	r.logger.Debug("Current default gateway", "gateway", gateway)
-
-	// 2. 添加到服务器的直接路由
-	r.logger.Debug("Adding direct route to server")
-	if err := r.runCmd("ip", "route", "add", r.serverIP, "via", gateway); err != nil {
-		r.logger.Warn("Failed to add server route", "error", err)
-	} else {
-		r.routesAdded = append(r.routesAdded, r.serverIP)
-	}
-
-	// 3. 使用分裂路由 (IPv4)
-	r.logger.Debug("Adding VPN routes (IPv4)")
-	if err := r.runCmd("ip", "route", "add", "0.0.0.0/1", "via", r.tunGateway); err != nil {
-		return fmt.Errorf("failed to add route: %w", err)
-	}
-	if err := r.runCmd("ip", "route", "add", "128.0.0.0/1", "via", r.tunGateway); err != nil {
-		return fmt.Errorf("failed to add route: %w", err)
-	}
-
-	// 4. 添加 IPv6 路由
-	if r.tunDevice != "" {
-		r.logger.Debug("Adding VPN routes (IPv6)", "device", r.tunDevice)
-		if err := r.runCmd("ip", "-6", "route", "add", "::/1", "dev", r.tunDevice); err != nil {
-			r.logger.Warn("Failed to add IPv6 route ::/1", "error", err)
-		}
-		if err := r.runCmd("ip", "-6", "route", "add", "8000::/1", "dev", r.tunDevice); err != nil {
-			r.logger.Warn("Failed to add IPv6 route 8000::/1", "error", err)
-		}
-	}
-
-	r.configured = true
-	r.logger.Info("VPN routes configured successfully")
-	return nil
-}
-
-// teardownLinux Linux 路由恢复
-func (r *RouteManager) teardownLinux() error {
-	var errs []error
-
-	// 删除 VPN 路由 (IPv4)
-	r.runCmd("ip", "route", "del", "0.0.0.0/1")
-	r.runCmd("ip", "route", "del", "128.0.0.0/1")
-
-	// 删除 IPv6 路由
-	r.runCmd("ip", "-6", "route", "del", "::/1")
-	r.runCmd("ip", "-6", "route", "del", "8000::/1")
-
-	// 删除服务器路由
-	for _, route := range r.routesAdded {
-		r.runCmd("ip", "route", "del", route)
-	}
-
-	r.configured = false
-	r.routesAdded = nil
-
-	if len(errs) > 0 {
-		r.logger.Warn("Some routes could not be removed")
-	} else {
-		r.logger.Info("Original routes restored")
-	}
-
-	return nil
-}
-
 // getDefaultGatewayDarwin 获取 macOS 默认网关
 func (r *RouteManager) getDefaultGatewayDarwin() (string, error) {
 	cmd := exec.Command("netstat", "-rn")
@@ -257,7 +185,97 @@ func (r *RouteManager) getDefaultGatewayDarwin() (string, error) {
 	return "", fmt.Errorf("default gateway not found")
 }
 
-// getDefaultGatewayLinux 获取 Linux 默认网关
+// setupLinux Linux 路由配置 (FwMark 模式)
+func (r *RouteManager) setupLinux() error {
+	// 1. 获取当前默认网关
+	gateway, err := r.getDefaultGatewayLinux()
+	if err != nil {
+		return fmt.Errorf("failed to get default gateway: %w", err)
+	}
+	r.logger.Debug("Current default gateway", "gateway", gateway)
+
+	// 添加到服务器的直接路由 (Main 表)
+	// 这是必须的，否则由 Hysteria 发出的 UDP 包会被 FwMark 规则路由进 VPN 隧道，导致死循环
+	r.logger.Debug("Adding direct route to server", "server", r.serverIP)
+	if err := r.runCmd("ip", "route", "add", r.serverIP, "via", gateway); err != nil {
+		r.logger.Warn("Failed to add server route (may already exist)", "error", err)
+	} else {
+		r.routesAdded = append(r.routesAdded, r.serverIP)
+	}
+
+	// 2. 添加路由到 table 51820
+	r.logger.Debug("Adding routes to table 51820")
+	// 添加 VPN 默认路由到表 51820
+	if err := r.runCmd("ip", "route", "add", "default", "dev", r.tunDevice, "table", "51820"); err != nil {
+		return fmt.Errorf("failed to add default route to table 51820: %w", err)
+	}
+	r.routesAdded = append(r.routesAdded, "default-51820") // 标记以便清理
+
+	// 3. 添加策略路由规则
+	r.logger.Debug("Adding policy routing rules")
+
+	// 规则 1: 查找 main 表，但忽略默认路由 (为了让本地子网流量直连)
+	// ip rule add lookup main suppress_prefixlength 0 priority 32764
+	if err := r.runCmd("ip", "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "priority", "32764"); err != nil {
+		r.logger.Warn("Failed to add suppress_prefixlength rule", "error", err)
+	}
+
+	// 规则 2: 所有未标记(非VPN自身)流量查 51820 表
+	// ip rule add not fwmark 51820 lookup 51820 priority 32765
+	if err := r.runCmd("ip", "rule", "add", "not", "fwmark", "51820", "lookup", "51820", "priority", "32765"); err != nil {
+		return fmt.Errorf("failed to add fwmark rule: %w", err)
+	}
+
+	// 4. 添加 IPv6 路由 (如果启用)
+	if r.tunDevice != "" {
+		// IPv6 同样逻辑
+		r.runCmd("ip", "-6", "route", "add", "default", "dev", r.tunDevice, "table", "51820")
+		r.runCmd("ip", "-6", "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "priority", "32764")
+		r.runCmd("ip", "-6", "rule", "add", "not", "fwmark", "51820", "lookup", "51820", "priority", "32765")
+	}
+
+	r.configured = true
+	r.logger.Info("VPN routes configured successfully (FwMark mode)")
+	return nil
+}
+
+// cleanupLinux Linux 路由清理 (FwMark 模式)
+func (r *RouteManager) cleanupLinux() error {
+	r.logger.Info("Cleaning up VPN routes (FwMark mode)")
+
+	// 1. 清理添加到 Main 表的显式路由 (服务器路由)
+	for _, route := range r.routesAdded {
+		if route != "default-51820" {
+			r.runCmd("ip", "route", "del", route)
+		}
+	}
+
+	// 2. 删除策略路由规则
+	// 顺序反向删除
+	// ip rule del not fwmark 51820 lookup 51820
+	r.runCmd("ip", "rule", "del", "not", "fwmark", "51820", "lookup", "51820")
+	// ip rule del lookup main suppress_prefixlength 0
+	r.runCmd("ip", "rule", "del", "lookup", "main", "suppress_prefixlength", "0")
+
+	// IPv6 规则清理
+	if r.tunDevice != "" {
+		r.runCmd("ip", "-6", "rule", "del", "not", "fwmark", "51820", "lookup", "51820")
+		r.runCmd("ip", "-6", "rule", "del", "lookup", "main", "suppress_prefixlength", "0")
+	}
+
+	// 2. 清空 51820 路由表
+	r.runCmd("ip", "route", "flush", "table", "51820")
+	if r.tunDevice != "" {
+		r.runCmd("ip", "-6", "route", "flush", "table", "51820")
+	}
+
+	r.configured = false
+	r.routesAdded = nil
+	r.logger.Info("VPN routes removed")
+	return nil
+}
+
+// getDefaultGatewayLinux 获取 Linux 默认网关 (FwMark 模式下仅用于日志)
 func (r *RouteManager) getDefaultGatewayLinux() (string, error) {
 	cmd := exec.Command("ip", "route", "show", "default")
 	output, err := cmd.Output()
@@ -265,7 +283,6 @@ func (r *RouteManager) getDefaultGatewayLinux() (string, error) {
 		return "", err
 	}
 
-	// 格式: default via 192.168.1.1 dev eth0
 	fields := strings.Fields(string(output))
 	for i, field := range fields {
 		if field == "via" && i+1 < len(fields) {

@@ -170,6 +170,11 @@ func (d *WireGuardDevice) buildIpcConfig() (string, error) {
 	}
 	builder.WriteString(fmt.Sprintf("private_key=%s\n", hex.EncodeToString(privateKey)))
 
+	// 设置 FwMark (Linux)
+	if runtime.GOOS == "linux" {
+		builder.WriteString(fmt.Sprintf("fwmark=%d\n", 51820))
+	}
+
 	// Peer 配置
 	publicKey, err := decodeWireGuardKey(d.config.WireGuard.Peer.PublicKey)
 	if err != nil {

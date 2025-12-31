@@ -14,6 +14,18 @@
 - ✅ **自动路由**: 自动配置系统路由和 DNS
 - ✅ **IPv6 支持**: 完整的双栈支持
 
+## 功能对比 (vs原版 WireGuard)
+
+| 功能特性 | 原版 WireGuard | HysterGuard (本客户端) | 说明 |
+| :--- | :--- | :--- | :--- |
+| **核心协议** | WireGuard (UDP) | Hysteria 2 (UDP/QUIC) + WireGuard | 核心区别。原版弱网性能差；HysterGuard 抗丢包、速度快。 |
+| **Linux 路由** | FwMark (table 51820) | FwMark (table 51820) | **完全一致**。都使用标准策略路由，此时支持 `ip rule` 绕过 VPN。 |
+| **macOS 路由** | NetworkExtension 或 `route` | `route` 命令 | HysterGuard 使用简单的 `route` 命令，功能与 wg-quick 的 bash 实现类似。 |
+| **Windows 路由** | Wintun 驱动 | Wintun 驱动 | HysterGuard Windows 版已使用 Wintun 驱动。 |
+| **PostUp/Down** | 支持 (任意命令) | 支持 (任意命令) | 功能一致。 |
+| **MTU 自动** | 自动发现 | 手动/默认 1280 | Hysteria 封装开销较大，建议设低一些 (1280 是安全值)。 |
+| **抗探测/混淆** | 无 (纯静态流量特征) | 强 (Salamander/Masquerade) | HysterGuard 很难被防火墙识别。 |
+
 ## 架构
 
 ```
@@ -281,10 +293,12 @@ tun:
 ```yaml
 tun:
   post_up:
-    - "ip -4 rule add from 你的服务器公网IP lookup main"
+    - "ip -4 rule add from 你的服务器公网IP lookup main priority 100"
   post_down:
-    - "ip -4 rule delete from 你的服务器公网IP lookup main"
+    - "ip -4 rule delete from 你的服务器公网IP lookup main priority 100"
 ```
+
+**原理**: HysterGuard 使用 FwMark 策略路由，主路由表 (`main`) 保持清洁。此规则让来自服务器 IP 的流量优先查询主表（直接走物理网关），从而绕过 VPN。
 
 **调试**: 使用 `-l debug` 检查 PostUp 是否执行：
 
