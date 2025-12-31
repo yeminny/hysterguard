@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hysterguard/hysterguard/internal/config"
 )
@@ -69,11 +70,20 @@ type ClientTunnel struct {
 	status Status
 	done   chan struct{}
 
+	// 上下文和取消函数
+	ctx      context.Context
+	cancelFn context.CancelFunc
+
 	// 组件
 	hysteriaRelay *HysteriaUDPRelay
 	wgDevice      *WireGuardDevice
 	routeManager  *RouteManager
 	dnsManager    *DNSManager
+
+	// 重连配置
+	reconnectEnabled  bool
+	reconnectInterval time.Duration
+	maxReconnectDelay time.Duration
 }
 
 // NewClientTunnel 创建客户端隧道
@@ -83,10 +93,13 @@ func NewClientTunnel(cfg *config.ClientConfig, logger *slog.Logger) (*ClientTunn
 	}
 
 	return &ClientTunnel{
-		config: cfg,
-		logger: logger,
-		status: StatusDisconnected,
-		done:   make(chan struct{}),
+		config:            cfg,
+		logger:            logger,
+		status:            StatusDisconnected,
+		done:              make(chan struct{}),
+		reconnectEnabled:  true,             // 默认启用自动重连
+		reconnectInterval: 5 * time.Second,  // 初始重连间隔
+		maxReconnectDelay: 60 * time.Second, // 最大重连间隔
 	}, nil
 }
 
@@ -98,12 +111,30 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 		return fmt.Errorf("tunnel already running")
 	}
 	t.status = StatusConnecting
+
+	// 保存上下文
+	t.ctx, t.cancelFn = context.WithCancel(ctx)
 	t.mu.Unlock()
 
 	t.logger.Info("Starting HysterGuard tunnel",
 		"server", t.config.Hysteria.Server,
 	)
 
+	// 执行首次连接
+	if err := t.connect(); err != nil {
+		return err
+	}
+
+	// 启动连接监控
+	if t.reconnectEnabled {
+		go t.connectionMonitor()
+	}
+
+	return nil
+}
+
+// connect 执行实际的连接过程（可重入）
+func (t *ClientTunnel) connect() error {
 	// 步骤 1: 建立 Hysteria 连接
 	t.logger.Debug("Connecting to Hysteria server...")
 	hyRelay, err := NewHysteriaUDPRelay(t.config, t.logger)
@@ -111,12 +142,16 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 		t.setStatus(StatusError)
 		return fmt.Errorf("failed to create Hysteria relay: %w", err)
 	}
-	t.hysteriaRelay = hyRelay
 
-	if err := hyRelay.Connect(ctx); err != nil {
+	if err := hyRelay.Connect(t.ctx); err != nil {
 		t.setStatus(StatusError)
 		return fmt.Errorf("failed to connect to Hysteria server: %w", err)
 	}
+
+	t.mu.Lock()
+	t.hysteriaRelay = hyRelay
+	t.mu.Unlock()
+
 	t.logger.Info("Hysteria connection established")
 
 	// 步骤 2: 启动 WireGuard（使用 Hysteria 作为传输层）
@@ -127,13 +162,16 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 		t.setStatus(StatusError)
 		return fmt.Errorf("failed to create WireGuard device: %w", err)
 	}
-	t.wgDevice = wgDevice
 
 	if err := wgDevice.Start(); err != nil {
 		hyRelay.Close()
 		t.setStatus(StatusError)
 		return fmt.Errorf("failed to start WireGuard device: %w", err)
 	}
+
+	t.mu.Lock()
+	t.wgDevice = wgDevice
+	t.mu.Unlock()
 
 	// 获取实际的 TUN 设备名称
 	tunDeviceName := wgDevice.GetTUNName()
@@ -167,7 +205,10 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 		}
 	}
 
+	t.mu.Lock()
 	t.routeManager = NewRouteManager(t.config.Hysteria.Server, tunGateway, tunDeviceName, t.logger)
+	t.mu.Unlock()
+
 	if err := t.routeManager.Setup(); err != nil {
 		t.logger.Warn("Failed to configure routes automatically", "error", err)
 		t.logger.Info("You may need to configure routes manually")
@@ -175,7 +216,10 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 
 	// 步骤 4: 配置 DNS
 	if len(t.config.TUN.DNS.Servers) > 0 {
+		t.mu.Lock()
 		t.dnsManager = NewDNSManager(t.config.TUN.DNS.Servers, t.logger)
+		t.mu.Unlock()
+
 		if err := t.dnsManager.Setup(); err != nil {
 			t.logger.Warn("Failed to configure DNS automatically", "error", err)
 		}
@@ -187,8 +231,115 @@ func (t *ClientTunnel) Start(ctx context.Context) error {
 	return nil
 }
 
+// connectionMonitor 连接监控协程，检测断连并自动重连
+func (t *ClientTunnel) connectionMonitor() {
+	delay := t.reconnectInterval
+	ticker := time.NewTicker(10 * time.Second) // 每10秒检查一次连接状态
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-t.done:
+			return
+		case <-ticker.C:
+			// 检查连接状态
+			if !t.isConnectionHealthy() {
+				t.logger.Warn("Connection lost, attempting to reconnect...")
+				t.setStatus(StatusConnecting)
+
+				// 清理旧连接（但保留 TUN 和路由）
+				t.cleanupConnection()
+
+				// 重连循环
+				for {
+					select {
+					case <-t.ctx.Done():
+						return
+					case <-t.done:
+						return
+					default:
+					}
+
+					t.logger.Info("Reconnecting...", "delay", delay)
+					time.Sleep(delay)
+
+					// 重新建立 Hysteria 连接
+					hyRelay, err := NewHysteriaUDPRelay(t.config, t.logger)
+					if err != nil {
+						t.logger.Error("Failed to create Hysteria relay", "error", err)
+						delay = minDuration(delay*2, t.maxReconnectDelay)
+						continue
+					}
+
+					if err := hyRelay.Connect(t.ctx); err != nil {
+						t.logger.Error("Failed to connect to Hysteria server", "error", err)
+						delay = minDuration(delay*2, t.maxReconnectDelay)
+						continue
+					}
+
+					t.mu.Lock()
+					t.hysteriaRelay = hyRelay
+					// 更新 WireGuard 的传输层
+					if t.wgDevice != nil && t.wgDevice.bind != nil {
+						t.wgDevice.bind.transport = hyRelay
+					}
+					t.mu.Unlock()
+
+					t.logger.Info("Reconnected successfully!")
+					t.setStatus(StatusConnected)
+					delay = t.reconnectInterval // 重置延迟
+					break
+				}
+			}
+		}
+	}
+}
+
+// isConnectionHealthy 检查连接是否健康
+func (t *ClientTunnel) isConnectionHealthy() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.hysteriaRelay == nil {
+		return false
+	}
+
+	// 检查 Hysteria 连接是否已关闭
+	if t.hysteriaRelay.closed.Load() {
+		return false
+	}
+
+	return true
+}
+
+// cleanupConnection 清理连接（但保留 TUN 和路由）
+func (t *ClientTunnel) cleanupConnection() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.hysteriaRelay != nil {
+		t.hysteriaRelay.Close()
+		t.hysteriaRelay = nil
+	}
+}
+
+// minDuration 返回两个 Duration 中较小的一个
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Stop 停止隧道
 func (t *ClientTunnel) Stop() error {
+	// 先取消上下文以停止连接监控
+	if t.cancelFn != nil {
+		t.cancelFn()
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
