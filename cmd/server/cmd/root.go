@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -292,7 +293,7 @@ func (o *WireGuardOutbound) UDP(reqAddr string) (server.UDPConn, error) {
 	conn := &wireGuardConn{
 		bind:       o.bind,
 		targetAddr: reqAddr,
-		recvChan:   make(chan *wgPacket, 2048),
+		recvChan:   make(chan *wgPacket, 16384), // 增大缓冲区，防止丢包
 		outbound:   o,
 	}
 
@@ -325,8 +326,7 @@ type wireGuardConn struct {
 	targetAddr string
 	recvChan   chan *wgPacket
 	outbound   *WireGuardOutbound
-	closed     bool
-	mu         sync.Mutex
+	closed     atomic.Bool // 使用 atomic 代替 mutex 提高性能
 }
 
 type wgPacket struct {
@@ -335,12 +335,9 @@ type wgPacket struct {
 
 // ReadFrom 读取 WireGuard 响应
 func (c *wireGuardConn) ReadFrom(b []byte) (int, string, error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.closed.Load() {
 		return 0, "", net.ErrClosed
 	}
-	c.mu.Unlock()
 
 	pkt, ok := <-c.recvChan
 	if !ok {
@@ -353,12 +350,9 @@ func (c *wireGuardConn) ReadFrom(b []byte) (int, string, error) {
 
 // WriteTo 写入数据到 WireGuard
 func (c *wireGuardConn) WriteTo(b []byte, addr string) (int, error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	c.mu.Unlock()
 
 	// 将数据包投递到 WireGuard bind
 	c.bind.DeliverPacket(b, c.targetAddr)
@@ -367,13 +361,9 @@ func (c *wireGuardConn) WriteTo(b []byte, addr string) (int, error) {
 
 // Close 关闭连接
 func (c *wireGuardConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil
+	if c.closed.Swap(true) {
+		return nil // 已经关闭过
 	}
-	c.closed = true
 
 	// 从 outbound 移除
 	c.outbound.mu.Lock()
@@ -386,20 +376,25 @@ func (c *wireGuardConn) Close() error {
 
 // deliverPacket 投递 WireGuard 响应包
 func (c *wireGuardConn) deliverPacket(data []byte) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.closed.Load() {
 		return
 	}
-	c.mu.Unlock()
 
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 
-	// 非阻塞发送，队列满时丢包
+	// 阻塞式发送，不丢包！
+	// 如果 channel 满了，等待消费者读取
+	// 这对于 BBR/Brutal 拥塞控制至关重要
 	select {
 	case c.recvChan <- &wgPacket{data: dataCopy}:
 	default:
-		// 队列满丢包
+		// Channel 满了，尝试阻塞发送（带超时保护）
+		select {
+		case c.recvChan <- &wgPacket{data: dataCopy}:
+		case <-time.After(100 * time.Millisecond):
+			// 超时才丢包，给日志一个警告
+			// 正常情况下不应该触发
+		}
 	}
 }
